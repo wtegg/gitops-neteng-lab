@@ -6,6 +6,12 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  CML_URL: ${{ secrets.CML_URL }}
+  CML_USERNAME: ${{ secrets.CML_USERNAME }}
+  CML_PASSWORD: ${{ secrets.CML_PASSWORD }}
+  CML_LAB_ID: ${{ secrets.CML_LAB_ID }}
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -28,3 +34,110 @@ jobs:
         with:
           name: network-configs
           path: artifacts/configs.tar.gz
+
+  deploy:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: network-configs
+          path: artifacts
+      - name: Extract package artifact
+        run: tar -xzf artifacts/configs.tar.gz -C .
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Authenticate to CML
+        id: cml_auth
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/authenticate'
+          method: 'POST'
+          customHeaders: '{"Content-Type": "application/json"}'
+          data: '{"username":"${{ env.CML_USERNAME }}","password":"${{ env.CML_PASSWORD }}"}'
+      - name: Normalize CML token
+        id: cml_token
+        run: |
+          TOKEN='${{ steps.cml_auth.outputs.response }}'
+          TOKEN="${TOKEN%\"}"
+          TOKEN="${TOKEN#\"}"
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+      - name: Get node inventory from the existing lab
+        id: node_inventory
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/nodes?data=true&exclude_configurations=true'
+          method: 'GET'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          responseFile: 'nodes.json'
+      - name: Map router labels to node IDs
+        id: node_map
+        run: |
+          for router in R1 R2 R3; do
+            node_id=$(jq -r --arg label "$router" '.[] | select(.label==$label) | .id' nodes.json)
+            echo "${router,,}_node_id=$node_id" >> "$GITHUB_OUTPUT"
+          done
+      - name: Stop existing CML lab
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/stop'
+          method: 'PUT'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          preventFailureOnNoResponse: 'true'
+      - name: Wipe existing CML lab
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/wipe'
+          method: 'PUT'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          preventFailureOnNoResponse: 'true'
+      - name: Build R1 configuration payload
+        id: r1_payload
+        run: |
+          json=$(jq -c -Rs '{configuration: .}' configs/router1.cfg)
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+      - name: Update R1 configuration
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/nodes/${{ steps.node_map.outputs.r1_node_id }}'
+          method: 'PATCH'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          customHeaders: '{"Content-Type": "application/json"}'
+          data: ${{ steps.r1_payload.outputs.json }}
+      - name: Build R2 configuration payload
+        id: r2_payload
+        run: |
+          json=$(jq -c -Rs '{configuration: .}' configs/router2.cfg)
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+      - name: Update R2 configuration
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/nodes/${{ steps.node_map.outputs.r2_node_id }}'
+          method: 'PATCH'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          customHeaders: '{"Content-Type": "application/json"}'
+          data: ${{ steps.r2_payload.outputs.json }}
+      - name: Build R3 configuration payload
+        id: r3_payload
+        run: |
+          json=$(jq -c -Rs '{configuration: .}' configs/router3.cfg)
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+      - name: Update R3 configuration
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/nodes/${{ steps.node_map.outputs.r3_node_id }}'
+          method: 'PATCH'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          customHeaders: '{"Content-Type": "application/json"}'
+          data: ${{ steps.r3_payload.outputs.json }}
+      - name: Start existing CML lab
+        uses: fjogeleit/http-request-action@v1.16.5
+        with:
+          url: '${{ env.CML_URL }}/api/v0/labs/${{ env.CML_LAB_ID }}/start'
+          method: 'PUT'
+          bearerToken: ${{ steps.cml_token.outputs.token }}
+          preventFailureOnNoResponse: 'true'
